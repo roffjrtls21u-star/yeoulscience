@@ -81,7 +81,8 @@
         } from 'lucide-react';
         import { initializeApp } from 'firebase/app';
         import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-        import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, writeBatch } from 'firebase/firestore';
+        // getDocs와 query를 추가로 import 합니다.
+        import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, getDocs, query } from 'firebase/firestore';
 
         // --- Firebase 설정 ---
         const firebaseConfig = {
@@ -253,8 +254,49 @@
                 XLSX.writeFile(wb, `과학실_재고_${new Date().toISOString().slice(0,10)}.xlsx`);
             };
 
+            // --- 🚨 전체 데이터 삭제 (초기화) 기능 ---
+            const resetInventory = async () => {
+                if (!window.confirm("경고! 💥 모든 재고 데이터가 영구적으로 삭제됩니다.\n\n정말 초기화하시겠습니까? (되돌릴 수 없습니다)")) return;
+                if (!window.confirm("진짜로 삭제합니다? 중복된 데이터를 모두 지우고 다시 시작합니다.")) return;
+
+                setUploading(true);
+                try {
+                    const q = query(collection(db, 'artifacts', PROJECT_ID, 'public', 'data', 'inventory'));
+                    const snapshot = await getDocs(q);
+                    
+                    // 400개씩 끊어서 삭제 (Firestore 제한 때문)
+                    const batchSize = 400;
+                    const chunks = [];
+                    let currentChunk = [];
+                    
+                    snapshot.docs.forEach(doc => {
+                        currentChunk.push(doc.id);
+                        if (currentChunk.length >= batchSize) {
+                            chunks.push(currentChunk);
+                            currentChunk = [];
+                        }
+                    });
+                    if (currentChunk.length > 0) chunks.push(currentChunk);
+
+                    for (const chunk of chunks) {
+                        const batch = writeBatch(db);
+                        chunk.forEach(id => {
+                            const ref = doc(db, 'artifacts', PROJECT_ID, 'public', 'data', 'inventory', id);
+                            batch.delete(ref);
+                        });
+                        await batch.commit();
+                    }
+                    
+                    showToast("모든 데이터가 삭제되었습니다. 이제 '초기데이터 업로드'를 한 번만 눌러주세요.");
+                } catch (e) {
+                    showToast("초기화 실패: " + e.message, 'error');
+                } finally {
+                    setUploading(false);
+                }
+            };
+
             const uploadInitialData = async () => {
-                if (!window.confirm("기존 데이터와 합쳐집니다. 업로드하시겠습니까?")) return;
+                if (!window.confirm("초기 데이터를 업로드하시겠습니까?")) return;
                 setUploading(true);
                 try {
                     const batch = writeBatch(db);
@@ -273,12 +315,7 @@
 
             // 필터링
             const activeLoans = loans.filter(l => l.status === 'borrowed');
-            
-            // ✅ 수정됨: 반납된 목록은 '반납일' 기준 최신순 정렬
-            const returnedLoans = loans
-                .filter(l => l.status === 'returned')
-                .sort((a, b) => new Date(b.returnDate) - new Date(a.returnDate));
-
+            const returnedLoans = loans.filter(l => l.status === 'returned').sort((a, b) => new Date(b.returnDate) - new Date(a.returnDate)).slice(0, 5);
             const filteredItems = useMemo(() => {
                 let items = roomFilter === 'all' ? inventory : inventory.filter(i => i.room === roomFilter);
                 if (searchTerm) items = items.filter(i => i.item.includes(searchTerm) || i.location.includes(searchTerm));
@@ -408,13 +445,19 @@
                                     <button onClick={()=>setRoomFilter('1과학실')} className={`px-3 py-1 rounded border ${roomFilter==='1과학실'?'bg-green-600 text-white':''}`}>1과학실</button>
                                     <button onClick={()=>setRoomFilter('2과학실')} className={`px-3 py-1 rounded border ${roomFilter==='2과학실'?'bg-blue-600 text-white':''}`}>2과학실</button>
                                 </div>
-                                <div className="flex gap-2 items-center">
+                                <div className="flex flex-wrap gap-2 items-center justify-end">
+                                    <button onClick={resetInventory} disabled={uploading} className="text-sm bg-red-50 text-red-600 border border-red-200 px-3 py-2 rounded-lg flex items-center gap-1 font-bold whitespace-nowrap hover:bg-red-100">
+                                        <Trash2 size={14}/> 전체삭제(초기화)
+                                    </button>
                                     <button onClick={exportToExcel} className="text-sm bg-green-50 text-green-700 border border-green-200 px-3 py-2 rounded-lg flex items-center gap-1 hover:bg-green-100 font-bold whitespace-nowrap">
                                         <Download size={16}/> 엑셀저장
                                     </button>
-                                    <button onClick={uploadInitialData} disabled={uploading} className="text-sm text-gray-500 underline flex items-center gap-1 whitespace-nowrap">
-                                        <Upload size={14}/> {uploading ? '업로드중...' : '초기데이터 업로드'}
-                                    </button>
+                                    {/* ✅ 데이터가 없을 때만 보이는 초기 데이터 업로드 버튼 */}
+                                    {(!loading && inventory.length === 0) && (
+                                        <button onClick={uploadInitialData} disabled={uploading} className="text-sm bg-indigo-50 text-indigo-600 border border-indigo-200 px-3 py-2 rounded-lg flex items-center gap-1 font-bold whitespace-nowrap animate-pulse">
+                                            <Upload size={14}/> {uploading ? '업로드중...' : '초기데이터 업로드'}
+                                        </button>
+                                    )}
                                 </div>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -460,14 +503,15 @@
                             </div>
                             
                             <div className="mt-8 border-t pt-4">
-                                <h3 className="text-gray-500 font-bold mb-4">최근 반납 기록</h3>
+                                <h3 className="text-gray-500 font-bold mb-4">최근 반납 기록 (5건)</h3>
                                 <div className="space-y-2">
-                                    {returnedLoans.slice(0, 5).map(loan => (
+                                    {returnedLoans.map(loan => (
                                         <div key={loan.id} className="flex justify-between text-sm text-gray-500 bg-gray-50 p-2 rounded">
                                             <span>{loan.itemName} ({loan.borrower})</span>
                                             <span>{loan.returnDate} 반납완료</span>
                                         </div>
                                     ))}
+                                    {returnedLoans.length === 0 && <div className="text-center text-gray-400 py-4">반납된 기록이 없습니다.</div>}
                                 </div>
                             </div>
                         </div>
